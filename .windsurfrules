@@ -1,0 +1,363 @@
+# Rules
+- Always use a development_plan.md to create a list of TODOs, issues, and other notes. Focus on tracking things that you can check off in groups. Mark things as done or put new blocks of work into the document in the right, logical order to complete them later if you run into them. Your aim is always to get through the development_plan.md to complete my task.
+- If command.md exists, use it to build your development_plan.md.
+- When creating CLIs, don't try to run them in interactive mode if they may hang waiting for input.
+- If building on recall SDKs or libs, try to use them as provided without replicating or duplicating their abilities.
+- Keep a checklist in your development_plan.md to track progress and completion of tasks.
+- Maintain excellent developer documentation within the code itself.
+
+# Recall network docs
+
+- You can always find docs here: docs.recall.network
+- You can find the Rust SDK here: https://github.com/recallnet/rust-recall
+- Importantly, you can get network connection information here: https://github.com/recallnet/rust-recall/blob/main/sdk/src/network.rs
+- You can find the Javascript SDK as one of the packages here: https://github.com/recallnet/js-recall
+- Generally, expect everything in Dev mode and Prod mode to just run on Testnet.
+- Rust SDK examples are particularly informative: https://github.com/recallnet/rust-recall/tree/main/sdk/examples
+- Other helpful Recall Rust libraries are here https://github.com/recallnet/rust-recall/blob/main/signer and https://github.com/recallnet/rust-recall/blob/main/provider. You have to install them via the git dependencies in Cargo.toml, since they aren't distributed yet.
+
+
+Here is how you add the Rust SDK, Provider, and Signer to a Cargo.toml:
+
+```
+recall_sdk = { git = "https://github.com/recallnet/rust-recall.git", subdirectory = "sdk", branch = "main" }
+recall_provider = {git = "https://github.com/recallnet/rust-recall.git", subdirectory = "provider", branch = "main" }
+recall_signer = {git = "https://github.com/recallnet/rust-recall.git", subdirectory = "signer", branch = "main" }
+```
+
+Here's an example of creating a bucket with the Rust SDK:
+
+```rust
+// Copyright 2025 Recall Contributors
+// SPDX-License-Identifier: Apache-2.0, MIT
+
+use std::collections::HashMap;
+use std::env;
+
+use anyhow::anyhow;
+use rand::{thread_rng, Rng};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{sleep, Duration};
+
+use recall_provider::json_rpc::JsonRpcProvider;
+use recall_sdk::{
+    machine::{
+        bucket::{AddOptions, Bucket, GetOptions, QueryOptions},
+        Machine,
+    },
+    network::Network,
+};
+use recall_signer::{key::parse_secret_key, AccountKind, Signer, Wallet};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        return Err(anyhow!("Usage: [private key]"));
+    }
+
+    let pk_kex = &args[2];
+    let pk = parse_secret_key(pk_kex)?;
+
+    // Use testnet network defaults
+    let cfg = Network::Testnet.get_config();
+
+    // Setup network provider
+    let provider = JsonRpcProvider::new_http(
+        cfg.rpc_url,
+        cfg.subnet_id.chain_id(),
+        None,
+        Some(cfg.object_api_url),
+    )?;
+
+    // Setup local wallet using private key from arg
+    let mut signer = Wallet::new_secp256k1(pk, AccountKind::Ethereum, cfg.subnet_id)?;
+    signer.init_sequence(&provider).await?;
+    let from = signer.address();
+
+    // Create a new bucket
+    let (machine, tx) = Bucket::new(
+        &provider,
+        &mut signer,
+        None,
+        HashMap::new(),
+        Default::default(),
+    )
+    .await?;
+    println!("Created new bucket {}", machine.address());
+    println!("Transaction hash: 0x{}", tx.hash());
+
+    // Create a temp file to add
+    let mut file = async_tempfile::TempFile::new().await?;
+    let mut rng = thread_rng();
+    let mut random_data = vec![0; 1024 * 1024]; // 1 MiB
+    rng.fill(&mut random_data[..]);
+    file.write_all(&random_data).await?;
+    file.flush().await?;
+
+    // Add a file to the bucket
+    let key = "foo/my_file";
+    let mut metadata = HashMap::new();
+    metadata.insert("foo".to_string(), "bar".to_string());
+    let options = AddOptions {
+        overwrite: true,
+        metadata,
+        ..Default::default()
+    };
+    let tx = machine
+        .add_from_path(&provider, &mut signer, from, key, file.file_path(), options)
+        .await?;
+    println!(
+        "Added 1MiB file to bucket {} with key {}",
+        machine.address(),
+        key,
+    );
+    println!("Transaction hash: 0x{}", tx.hash());
+
+    // Wait some time for the network to resolve the object
+    sleep(Duration::from_secs(2)).await;
+
+    // Query for the object
+    let options = QueryOptions {
+        prefix: "foo/".into(),
+        ..Default::default()
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let list = machine.query(&provider, options).await?;
+    for (key_bytes, object) in list.objects {
+        let key = core::str::from_utf8(&key_bytes).unwrap_or_default();
+        println!("Query result for key {}: {}", key, object.hash);
+    }
+
+    // Download the actual object at `foo/my_file`
+    let obj_file = async_tempfile::TempFile::new().await?;
+    let obj_path = obj_file.file_path().to_owned();
+    println!("Downloading object to {}", obj_path.display());
+    let options = GetOptions {
+        range: Some("0-99".to_string()), // Get the first 100 bytes
+        ..Default::default()
+    };
+    {
+        let open_file = obj_file.open_rw().await?;
+        machine.get(&provider, key, open_file, options).await?;
+    }
+    // Read the first 10 bytes of your downloaded 100 bytes
+    let mut read_file = tokio::fs::File::open(&obj_path).await?;
+    let mut contents = vec![0; 10];
+    read_file.read_exact(&mut contents).await?;
+    println!("Successfully read first 10 bytes of {}", obj_path.display());
+
+    // Now, delete the object
+    let tx = machine
+        .delete(&provider, &mut signer, from, key, Default::default())
+        .await?;
+    println!("Deleted object with key {} at tx 0x{}", key, tx.hash());
+
+    Ok(())
+}
+```
+
+Here is an example of working with credits:
+
+```rust
+// Copyright 2025 Recall Contributors
+// SPDX-License-Identifier: Apache-2.0, MIT
+
+use std::env;
+
+use anyhow::anyhow;
+
+use recall_provider::{
+    fvm_shared::econ::TokenAmount, json_rpc::JsonRpcProvider, message::GasParams,
+    query::FvmQueryHeight, tx::TxStatus,
+};
+use recall_sdk::{
+    account::{Account, EVMSubnet},
+    credits::{ApproveOptions, BuyOptions, Credits, RevokeOptions},
+    network::Network,
+};
+use recall_signer::{
+    key::{parse_secret_key, random_secretkey},
+    AccountKind, Signer, Wallet,
+};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        return Err(anyhow!("Usage: [private key]"));
+    }
+
+    let pk_hex = &args[1];
+    let pk = parse_secret_key(pk_hex)?;
+
+    // Use testnet network defaults
+    let cfg = Network::Testnet.get_config();
+
+    // Setup network provider
+    let provider = JsonRpcProvider::new_http(cfg.rpc_url, cfg.subnet_id.chain_id(), None, None)?;
+
+    // Setup local wallet using private key from arg
+    let mut signer = Wallet::new_secp256k1(pk, AccountKind::Ethereum, cfg.subnet_id.clone())?;
+    signer.init_sequence(&provider).await?;
+
+    let signer_address = signer.address();
+
+    // Create a second wallet to approve credits for
+    let second_key = random_secretkey();
+    let second_wallet =
+        Wallet::new_secp256k1(second_key, AccountKind::Ethereum, cfg.subnet_id.clone())?;
+    let second_address = second_wallet.address();
+
+    println!("Main wallet address: {}", signer_address);
+    println!("Second wallet address: {}", second_address);
+
+    // Initialize the second account by sending a zero-value transaction
+    let subnet = EVMSubnet {
+        id: cfg.subnet_id.clone(),
+        provider_http: cfg.evm_rpc_url.clone(),
+        provider_timeout: None,
+        auth_token: None,
+        registry_addr: cfg.evm_registry_address,
+        gateway_addr: cfg.evm_gateway_address,
+        supply_source: None,
+    };
+
+    let tx = Account::transfer(&signer, second_address, subnet, TokenAmount::from_whole(0)).await?;
+    println!(
+        "Initialized second account - Transaction hash: {}",
+        tx.transaction_hash
+    );
+
+    // Wait for the transfer to be confirmed
+    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+    signer.init_sequence(&provider).await?;
+
+    // Now we can initialize the second wallet's sequence
+    let mut second_wallet = second_wallet;
+    second_wallet.init_sequence(&provider).await?;
+
+    // First, let's check the current credit balance
+    let balance = Credits::balance(&provider, signer_address, FvmQueryHeight::Committed).await?;
+    println!("Initial credit balance: {:?}", balance);
+
+    // Buy credits for our account
+    let amount = TokenAmount::from_whole(1); // Buy 1 token worth of credits
+    let buy_options = BuyOptions {
+        gas_params: GasParams {
+            gas_limit: 0, // Let the system estimate gas
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let tx = Credits::buy(&provider, &mut signer, signer_address, amount, buy_options).await?;
+    println!("Bought credits - Transaction hash: 0x{}", tx.hash());
+    if let TxStatus::Committed(receipt) = tx.status {
+        println!("Gas used: {}", receipt.gas_used.unwrap_or_default());
+    }
+    println!("New balance: {:?}", tx.data);
+
+    // Approve credits for the second wallet
+    let approve_options = ApproveOptions {
+        credit_limit: None,  // No limit
+        gas_fee_limit: None, // No gas fee limit
+        ttl: None,           // No time limit
+        gas_params: GasParams {
+            gas_limit: 0, // Let the system estimate gas
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let tx = Credits::approve(
+        &provider,
+        &mut signer,
+        signer_address,
+        second_address,
+        approve_options,
+    )
+    .await?;
+    println!("Approved credits - Transaction hash: 0x{}", tx.hash());
+    if let TxStatus::Committed(receipt) = tx.status {
+        println!("Gas used: {}", receipt.gas_used.unwrap_or_default());
+    }
+    println!("Approval details: {:?}", tx.data);
+
+    // Wait for the approval to be confirmed
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Check the second wallet's balance and approvals
+    let second_balance =
+        Credits::balance(&provider, second_address, FvmQueryHeight::Committed).await?;
+    println!("Second wallet credit balance: {:?}", second_balance);
+    println!(
+        "Second wallet credit approvals: {:?}",
+        second_balance.approvals_from
+    );
+
+    // Revoke credits from the second wallet
+    let revoke_options = RevokeOptions {
+        gas_params: GasParams {
+            gas_limit: 0, // Let the system estimate gas
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let tx = Credits::revoke(
+        &provider,
+        &mut signer,
+        signer_address,
+        second_address,
+        revoke_options,
+    )
+    .await?;
+    println!("Revoked credits - Transaction hash: 0x{}", tx.hash());
+    if let TxStatus::Committed(receipt) = tx.status {
+        println!("Gas used: {}", receipt.gas_used.unwrap_or_default());
+    }
+
+    // Wait for revocation to be confirmed
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Check first wallet's balance and approvals to verify revocation
+    let first_balance =
+        Credits::balance(&provider, signer_address, FvmQueryHeight::Committed).await?;
+    println!(
+        "First wallet approvals after revocation: {:?}",
+        first_balance.approvals_from
+    );
+
+    // Check final credit balances
+    let final_balance =
+        Credits::balance(&provider, signer_address, FvmQueryHeight::Committed).await?;
+    println!("Final main wallet credit balance: {:?}", final_balance);
+
+    let final_second_balance =
+        Credits::balance(&provider, second_address, FvmQueryHeight::Committed).await?;
+    println!(
+        "Final second wallet credit balance: {:?}",
+        final_second_balance
+    );
+
+    Ok(())
+}
+```
+
+Other notes:
+
+### Address Handling
+
+- Use a consistent pattern for address conversion (Filecoin ↔ Ethereum)
+- Always use the SDK's built-in get_eth_address function rather than implementing custom conversion
+
+### Network Configuration
+
+- Use the Rust SDK's built-in network configuration, don't make them up.
+
+### Wallet Funding
+
+- If users need a funded wallet, they can get funds by submitting their public key to https://faucet.recall.network/
+- Once a user has funds, they need to convert some portion of them to Credits. This can be done on the Portal, or you can examine the SDK to write a function for it.
